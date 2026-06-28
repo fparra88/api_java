@@ -1,0 +1,33 @@
+[Unit]
+Description=API Pendientes F&C (Java, cola de prioridad, REST)
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=simple
+User=pendientes
+Group=pendientes
+
+# Carpeta donde se clono el repo y se corrio build.sh (genera out/ y lib/).
+WorkingDirectory=/opt/pendientes-api
+
+# Credenciales fuera del repo. Env.java tambien lee variables del SO,
+# asi que NO hace falta un .env en produccion: este archivo las inyecta.
+EnvironmentFile=/etc/pendientes-api/pendientes-api.env
+
+# La JVM expande el comodin lib/* (no necesita shell).
+ExecStart=/usr/bin/java -cp out:lib/* com.fyc.pendientes.Main
+
+Restart=on-failure
+RestartSec=5
+# systemctl stop envia SIGTERM -> la JVM sale con 143; no es fallo.
+SuccessExitStatus=143
+
+# Endurecimiento basico
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

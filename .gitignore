@@ -1,0 +1,20 @@
+# Secrets — nunca subir credenciales
+.env
+
+# Artefactos de compilacion
+bin/
+out/
+*.class
+sources.txt
+
+# Dependencia descargada (la baja build.sh / run.ps1)
+lib/
+
+# IDE
+.vscode/
+
+# Logs
+*.log
+
+# Script solo Windows (no se usa en Ubuntu)
+run.ps1
