@@ -55,12 +55,23 @@ public class PendienteDAO {
      * Util para saber si quedo una tarea 'en proceso' sin terminar.
      */
     public Pendiente buscarPrimeroPorEstado(String estado) throws SQLException {
+        return buscarPrimeroPorEstado(estado, null);
+    }
+
+    /**
+     * Igual que {@link #buscarPrimeroPorEstado(String)}, pero limitado a un usuario.
+     * Con usuario=null busca en todos (comportamiento global).
+     */
+    public Pendiente buscarPrimeroPorEstado(String estado, String usuario) throws SQLException {
         String sql = "SELECT id, fecha, usuario, actividad, prioridad, estado, "
                    + "observaciones, fecha_promesa FROM pendientes "
-                   + "WHERE estado = ? ORDER BY id LIMIT 1";
+                   + "WHERE estado = ?";
+        if (usuario != null) sql += " AND LOWER(usuario) = LOWER(?)";
+        sql += " ORDER BY id LIMIT 1";
         try (Connection c = conectar();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setString(1, estado);
+            if (usuario != null) ps.setString(2, usuario);
             try (ResultSet rs = ps.executeQuery()) {
                 return rs.next() ? mapear(rs) : null;
             }

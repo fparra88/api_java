@@ -14,7 +14,8 @@ import java.util.List;
 /**
  * API HTTP usando el servidor embebido del JDK (sin frameworks).
  *
- * Endpoints:
+ * Endpoints (todos los GET/POST de cola aceptan ?usuario=xxx para trabajar
+ * solo con las tareas de ese usuario; sin el parametro operan en modo global):
  *   GET  /api/pendientes              -> lista en orden de prioridad
  *   GET  /api/pendientes/siguiente    -> proximo a atender (peek)
  *   GET  /api/pendientes/en-proceso   -> tarea 'en proceso' bloqueante (para finalizar)
@@ -60,6 +61,7 @@ public class ApiServer {
         if (preflight(ex)) return;
         String path = ex.getRequestURI().getPath();
         String metodo = ex.getRequestMethod();
+        String usuario = usuarioDeQuery(ex); // null = comportamiento global
 
         try {
             // POST /api/pendientes/{id}/terminar
@@ -75,23 +77,23 @@ public class ApiServer {
                 }
                 return;
             }
-            // POST /api/pendientes/atender
+            // POST /api/pendientes/atender?usuario=xxx
             if (metodo.equalsIgnoreCase("POST") && path.endsWith("/atender")) {
-                Pendiente p = gestor.atenderSiguiente("en proceso");
+                Pendiente p = gestor.atenderSiguiente("en proceso", usuario);
                 if (p == null) { responder(ex, 404, "{\"mensaje\":\"No hay pendientes en cola\"}"); return; }
-                responder(ex, 200, "{\"atendido\":" + p.toJson() + ",\"enCola\":" + gestor.tamano() + "}");
+                responder(ex, 200, "{\"atendido\":" + p.toJson() + ",\"enCola\":" + gestor.tamano(usuario) + "}");
                 return;
             }
-            // GET /api/pendientes/en-proceso  -> tarea bloqueante a finalizar
+            // GET /api/pendientes/en-proceso?usuario=xxx  -> tarea bloqueante a finalizar
             if (metodo.equalsIgnoreCase("GET") && path.endsWith("/en-proceso")) {
-                Pendiente p = gestor.verEnProceso();
+                Pendiente p = gestor.verEnProceso(usuario);
                 if (p == null) { responder(ex, 404, "{\"mensaje\":\"No hay tarea en proceso\"}"); return; }
                 responder(ex, 200, p.toJson());
                 return;
             }
-            // GET /api/pendientes/siguiente
+            // GET /api/pendientes/siguiente?usuario=xxx
             if (metodo.equalsIgnoreCase("GET") && path.endsWith("/siguiente")) {
-                Pendiente p = gestor.verSiguiente();
+                Pendiente p = gestor.verSiguiente(usuario);
                 if (p == null) { responder(ex, 404, "{\"mensaje\":\"Cola vacia\"}"); return; }
                 responder(ex, 200, p.toJson());
                 return;
@@ -109,9 +111,9 @@ public class ApiServer {
                 }
                 return;
             }
-            // GET /api/pendientes  -> lista ordenada
+            // GET /api/pendientes?usuario=xxx  -> lista ordenada (filtrada por usuario si viene el param)
             if (metodo.equalsIgnoreCase("GET")) {
-                List<Pendiente> lista = gestor.enOrden();
+                List<Pendiente> lista = gestor.enOrden(usuario);
                 StringBuilder sb = new StringBuilder("[");
                 for (int i = 0; i < lista.size(); i++) {
                     if (i > 0) sb.append(',');
@@ -146,11 +148,13 @@ public class ApiServer {
 
     private void manejarEstadisticas(HttpExchange ex) throws IOException {
         if (preflight(ex)) return;
-        responder(ex, 200, gestor.estadisticasJson());
+        responder(ex, 200, gestor.estadisticasJson(usuarioDeQuery(ex)));
     }
 
     private void manejarRaiz(HttpExchange ex) throws IOException {
-        String body = "{\"servicio\":\"API Pendientes F&C\",\"endpoints\":["
+        String body = "{\"servicio\":\"API Pendientes Zeutica\","
+                + "\"nota\":\"agrega ?usuario=xxx para operar solo con las tareas de ese usuario\","
+                + "\"endpoints\":["
                 + "\"GET /api/pendientes\",\"GET /api/pendientes/siguiente\","
                 + "\"GET /api/pendientes/en-proceso\","
                 + "\"GET /api/pendientes/:id\",\"POST /api/pendientes/atender\","
@@ -160,6 +164,28 @@ public class ApiServer {
     }
 
     // ---- util ----
+
+    /** Usuario de la query (?usuario=Juan) normalizado: null si no viene o esta vacio. */
+    private String usuarioDeQuery(HttpExchange ex) {
+        String usuario = queryParam(ex, "usuario");
+        if (usuario == null || usuario.isBlank()) return null;
+        return usuario.trim();
+    }
+
+    /** Lee un parametro de la query string (?usuario=Juan&otro=x). Null si no viene. */
+    private String queryParam(HttpExchange ex, String nombre) {
+        String query = ex.getRequestURI().getRawQuery();
+        if (query == null) return null;
+        for (String par : query.split("&")) {
+            int eq = par.indexOf('=');
+            String clave = (eq >= 0) ? par.substring(0, eq) : par;
+            if (clave.equals(nombre)) {
+                String valor = (eq >= 0) ? par.substring(eq + 1) : "";
+                return java.net.URLDecoder.decode(valor, StandardCharsets.UTF_8);
+            }
+        }
+        return null;
+    }
 
     private void responder(HttpExchange ex, int codigo, String json) throws IOException {
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
