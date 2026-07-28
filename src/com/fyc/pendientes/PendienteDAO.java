@@ -51,40 +51,47 @@ public class PendienteDAO {
     }
 
     /**
-     * Devuelve el primer pendiente con el estado dado (o null si no hay).
-     * Util para saber si quedo una tarea 'en proceso' sin terminar.
-     */
-    public Pendiente buscarPrimeroPorEstado(String estado) throws SQLException {
-        return buscarPrimeroPorEstado(estado, null);
-    }
-
-    /**
-     * Igual que {@link #buscarPrimeroPorEstado(String)}, pero limitado a un usuario.
+     * Todos los pendientes con el estado dado, ordenados por id.
      * Con usuario=null busca en todos (comportamiento global).
+     * Necesario porque un usuario puede tener varias tareas 'en proceso' a la vez
+     * (todas del mismo nivel de prioridad).
      */
-    public Pendiente buscarPrimeroPorEstado(String estado, String usuario) throws SQLException {
+    public List<Pendiente> listarPorEstado(String estado, String usuario) throws SQLException {
         String sql = "SELECT id, fecha, usuario, actividad, prioridad, estado, "
                    + "observaciones, fecha_promesa FROM pendientes "
                    + "WHERE estado = ?";
         if (usuario != null) sql += " AND LOWER(usuario) = LOWER(?)";
-        sql += " ORDER BY id LIMIT 1";
+        sql += " ORDER BY id";
+
+        List<Pendiente> lista = new ArrayList<>();
         try (Connection c = conectar();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setString(1, estado);
             if (usuario != null) ps.setString(2, usuario);
             try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? mapear(rs) : null;
+                while (rs.next()) lista.add(mapear(rs));
             }
         }
+        return lista;
     }
 
     /** Actualiza el estado de un pendiente. Devuelve true si afecto alguna fila. */
     public boolean actualizarEstado(int id, String nuevoEstado) throws SQLException {
+        return actualizarEstado(id, nuevoEstado, null);
+    }
+
+    /**
+     * Igual, pero solo si el pendiente pertenece al usuario (null = sin restriccion).
+     * Evita que un usuario cierre tareas ajenas conociendo el id.
+     */
+    public boolean actualizarEstado(int id, String nuevoEstado, String usuario) throws SQLException {
         String sql = "UPDATE pendientes SET estado = ? WHERE id = ?";
+        if (usuario != null) sql += " AND LOWER(usuario) = LOWER(?)";
         try (Connection c = conectar();
              PreparedStatement ps = c.prepareStatement(sql)) {
             ps.setString(1, nuevoEstado);
             ps.setInt(2, id);
+            if (usuario != null) ps.setString(3, usuario);
             return ps.executeUpdate() > 0;
         }
     }

@@ -91,17 +91,23 @@ public class GestorPendientes {
     }
 
     /**
-     * Devuelve la tarea actualmente 'en proceso' (la que bloquea atenderSiguiente),
-     * o null si no hay ninguna. Consulta la BD: las 'en proceso' no viven en la cola
-     * (recargarDesdeBD solo carga 'pendiente'). El front la usa para finalizarla.
+     * TODAS las tareas 'en proceso' del usuario (null = todas), en orden de atencion.
+     * Un usuario puede tener varias abiertas siempre que sean del mismo nivel.
      */
-    public synchronized Pendiente verEnProceso() throws SQLException {
-        return dao.buscarPrimeroPorEstado("en proceso");
+    public synchronized List<Pendiente> verEnProcesoLista(String usuario) throws SQLException {
+        List<Pendiente> lista = dao.listarPorEstado("en proceso", usuario);
+        lista.sort(ORDEN);
+        return lista;
     }
 
-    /** Tarea 'en proceso' del usuario dado (null = cualquiera). */
-    public synchronized Pendiente verEnProceso(String usuario) throws SQLException {
-        return dao.buscarPrimeroPorEstado("en proceso", usuario);
+    /** Nivel de prioridad mas urgente entre las tareas 'en proceso' del usuario (0 = ninguna). */
+    private int nivelEnProceso(String usuario) throws SQLException {
+        int min = 0;
+        for (Pendiente p : dao.listarPorEstado("en proceso", usuario)) {
+            int n = p.prioridadNumerica();
+            if (min == 0 || n < min) min = n;
+        }
+        return min;
     }
 
     /** Busca un pendiente por id en O(1). */
@@ -114,22 +120,17 @@ public class GestorPendientes {
      * Devuelve el pendiente atendido, o null si no hay nada en cola.
      */
     public synchronized Pendiente atenderSiguiente(String nuevoEstado)
-            throws SQLException, HayTareaEnProcesoException {
+            throws SQLException {
         return atenderSiguiente(nuevoEstado, null);
     }
 
     /**
-     * Atiende el siguiente del usuario dado (null = global). El bloqueo por tarea
-     * 'en proceso' tambien es por usuario: la tarea abierta de un usuario no
-     * bloquea a los demas.
+     * Atiende el siguiente del usuario dado (null = global). Se puede tomar otra
+     * tarea con una ya 'en proceso', mientras sea del mismo nivel de prioridad;
+     * el estado abierto de un usuario nunca afecta a los demas.
      */
     public synchronized Pendiente atenderSiguiente(String nuevoEstado, String usuario)
-            throws SQLException, HayTareaEnProcesoException {
-        // Guard: no entregar la proxima si quedo una tarea 'en proceso' sin terminar.
-        // Se consulta la BD (no solo memoria) para sobrevivir reinicios del server.
-        Pendiente bloqueante = dao.buscarPrimeroPorEstado("en proceso", usuario);
-        if (bloqueante != null) throw new HayTareaEnProcesoException(bloqueante);
-
+            throws SQLException {
         Pendiente p;
         if (usuario == null) {
             p = cola.poll();
@@ -138,6 +139,16 @@ public class GestorPendientes {
             if (p != null) cola.remove(p);
         }
         if (p == null) return null;
+
+        // Las 'en proceso' salen de la cola: si alguna es de nivel superior al
+        // siguiente en cola, no se puede bajar de nivel todavia. Se consulta la BD
+        // (no solo memoria) para sobrevivir reinicios del server.
+        int nivelAbierto = nivelEnProceso(usuario);
+        if (nivelAbierto > 0 && nivelAbierto < p.prioridadNumerica()) {
+            cola.offer(p); // devolver: no se atendio
+            throw new IllegalStateException(
+                "Tienes tareas de prioridad superior en proceso; terminalas antes de bajar de nivel");
+        }
 
         dao.actualizarEstado(p.id, nuevoEstado);
 
@@ -153,13 +164,57 @@ public class GestorPendientes {
     }
 
     /**
-     * Marca un pendiente como terminado (debe estar en registro, tipicamente 'en proceso').
-     * Devuelve false si el id no existe en registro.
+     * Atiende un pendiente especifico (elegido por el usuario) en vez del top de la cola.
+     * Permite varias tareas 'en proceso' a la vez, siempre del MISMO nivel de prioridad:
+     * el usuario puede abrir otra tarea del nivel actual sin cerrar la que ya tiene.
+     * Reglas:
+     *  - la tarea debe estar en cola y, si se da usuario, pertenecerle (null si no)
+     *  - no debe quedar en cola otra tarea del usuario con prioridad MAS alta
+     *    (IllegalStateException); dentro del mismo nivel cualquier tarea es valida.
+     *  - tampoco puede tener abierta una tarea de prioridad MAS alta: las 'en proceso'
+     *    salen de la cola, asi que se consultan aparte en la BD.
      */
-    public synchronized boolean terminar(int id) throws SQLException {
+    public synchronized Pendiente atenderPorId(int id, String nuevoEstado, String usuario)
+            throws SQLException {
+        Pendiente p = registro.get(id);
+        if (p == null || !cola.contains(p)) return null;
+        if (usuario != null && !esDeUsuario(p, usuario)) return null;
+
+        for (Pendiente otro : cola) {
+            if (usuario != null && !esDeUsuario(otro, usuario)) continue;
+            if (otro.prioridadNumerica() < p.prioridadNumerica()) {
+                throw new IllegalStateException(
+                    "Hay tareas de prioridad superior pendientes (" + otro.prioridad + ")");
+            }
+        }
+        int nivelAbierto = nivelEnProceso(usuario);
+        if (nivelAbierto > 0 && nivelAbierto < p.prioridadNumerica()) {
+            throw new IllegalStateException(
+                "Tienes tareas de prioridad superior en proceso; terminalas antes de bajar de nivel");
+        }
+
+        cola.remove(p);
+        dao.actualizarEstado(p.id, nuevoEstado);
+
+        contadorEstado.merge(p.estado, -1, Integer::sum);
+        p.estado = nuevoEstado;
+        contadorEstado.merge(p.estado, 1, Integer::sum);
+        atendidos++;
+        if (p.usuario != null) {
+            atendidosPorUsuario.merge(p.usuario.toLowerCase(), 1, Integer::sum);
+        }
+        return p;
+    }
+
+    /**
+     * Marca un pendiente como terminado. Con usuario != null solo cierra tareas
+     * de ese usuario (la BD valida pertenencia en el mismo UPDATE).
+     * Devuelve false si el id no existe o no pertenece al usuario.
+     */
+    public synchronized boolean terminar(int id, String usuario) throws SQLException {
         // Actualiza la BD directo: una tarea 'en proceso' puede no estar en
         // 'registro' tras un reinicio (recargarDesdeBD solo carga 'pendiente').
-        boolean filaActualizada = dao.actualizarEstado(id, "terminado");
+        boolean filaActualizada = dao.actualizarEstado(id, "terminado", usuario);
         if (!filaActualizada) return false;
 
         Pendiente p = registro.get(id);

@@ -18,7 +18,7 @@ import java.util.List;
  * solo con las tareas de ese usuario; sin el parametro operan en modo global):
  *   GET  /api/pendientes              -> lista en orden de prioridad
  *   GET  /api/pendientes/siguiente    -> proximo a atender (peek)
- *   GET  /api/pendientes/en-proceso   -> tarea 'en proceso' bloqueante (para finalizar)
+ *   GET  /api/pendientes/en-proceso   -> array de tareas 'en proceso' (para finalizar)
  *   GET  /api/pendientes/{id}         -> busca por id (HashMap O(1))
  *   POST /api/pendientes/atender      -> atiende el siguiente (poll) -> estado 'en proceso'
  *   POST /api/pendientes/{id}/terminar -> marca como terminado
@@ -69,7 +69,7 @@ public class ApiServer {
                 String segmento = path.substring("/api/pendientes/".length()); // "5/terminar"
                 String idStr = segmento.replace("/terminar", "");
                 try {
-                    boolean ok = gestor.terminar(Integer.parseInt(idStr));
+                    boolean ok = gestor.terminar(Integer.parseInt(idStr), usuario);
                     if (!ok) { responder(ex, 404, "{\"mensaje\":\"No encontrado\"}"); return; }
                     responder(ex, 200, "{\"terminado\":true,\"id\":" + idStr + "}");
                 } catch (NumberFormatException nfe) {
@@ -77,18 +77,36 @@ public class ApiServer {
                 }
                 return;
             }
-            // POST /api/pendientes/atender?usuario=xxx
+            // POST /api/pendientes/atender?usuario=xxx        -> atiende el top de la cola
+            // POST /api/pendientes/{id}/atender?usuario=xxx   -> atiende una tarea elegida
             if (metodo.equalsIgnoreCase("POST") && path.endsWith("/atender")) {
-                Pendiente p = gestor.atenderSiguiente("en proceso", usuario);
-                if (p == null) { responder(ex, 404, "{\"mensaje\":\"No hay pendientes en cola\"}"); return; }
-                responder(ex, 200, "{\"atendido\":" + p.toJson() + ",\"enCola\":" + gestor.tamano(usuario) + "}");
+                String idStr = path.substring("/api/pendientes".length())
+                                   .replace("/atender", "").replace("/", "");
+                if (!idStr.isEmpty()) {
+                    try {
+                        Pendiente p = gestor.atenderPorId(Integer.parseInt(idStr), "en proceso", usuario);
+                        if (p == null) { responder(ex, 404, "{\"mensaje\":\"No encontrado en cola\"}"); return; }
+                        responder(ex, 200, "{\"atendido\":" + p.toJson() + ",\"enCola\":" + gestor.tamano(usuario) + "}");
+                    } catch (NumberFormatException nfe) {
+                        responder(ex, 400, "{\"error\":\"id invalido\"}");
+                    } catch (IllegalStateException ise) {
+                        // Regla de niveles: existe tarea de prioridad superior sin atender.
+                        responder(ex, 409, "{\"error\":\"" + escapar(ise.getMessage()) + "\"}");
+                    }
+                    return;
+                }
+                try {
+                    Pendiente p = gestor.atenderSiguiente("en proceso", usuario);
+                    if (p == null) { responder(ex, 404, "{\"mensaje\":\"No hay pendientes en cola\"}"); return; }
+                    responder(ex, 200, "{\"atendido\":" + p.toJson() + ",\"enCola\":" + gestor.tamano(usuario) + "}");
+                } catch (IllegalStateException ise) {
+                    responder(ex, 409, "{\"error\":\"" + escapar(ise.getMessage()) + "\"}");
+                }
                 return;
             }
-            // GET /api/pendientes/en-proceso?usuario=xxx  -> tarea bloqueante a finalizar
+            // GET /api/pendientes/en-proceso?usuario=xxx  -> tareas abiertas (array, puede ser varias)
             if (metodo.equalsIgnoreCase("GET") && path.endsWith("/en-proceso")) {
-                Pendiente p = gestor.verEnProceso(usuario);
-                if (p == null) { responder(ex, 404, "{\"mensaje\":\"No hay tarea en proceso\"}"); return; }
-                responder(ex, 200, p.toJson());
+                responder(ex, 200, jsonLista(gestor.verEnProcesoLista(usuario)));
                 return;
             }
             // GET /api/pendientes/siguiente?usuario=xxx
@@ -113,21 +131,10 @@ public class ApiServer {
             }
             // GET /api/pendientes?usuario=xxx  -> lista ordenada (filtrada por usuario si viene el param)
             if (metodo.equalsIgnoreCase("GET")) {
-                List<Pendiente> lista = gestor.enOrden(usuario);
-                StringBuilder sb = new StringBuilder("[");
-                for (int i = 0; i < lista.size(); i++) {
-                    if (i > 0) sb.append(',');
-                    sb.append(lista.get(i).toJson());
-                }
-                sb.append(']');
-                responder(ex, 200, sb.toString());
+                responder(ex, 200, jsonLista(gestor.enOrden(usuario)));
                 return;
             }
             responder(ex, 405, "{\"error\":\"metodo no permitido\"}");
-        } catch (HayTareaEnProcesoException e) {
-            // 409 Conflict: hay una tarea sin terminar; el front debe cerrarla primero.
-            responder(ex, 409, "{\"error\":\"" + escapar(e.getMessage())
-                    + "\",\"enProceso\":" + e.tarea.toJson() + "}");
         } catch (SQLException e) {
             responder(ex, 500, "{\"error\":\"BD: " + escapar(e.getMessage()) + "\"}");
         }
@@ -164,6 +171,16 @@ public class ApiServer {
     }
 
     // ---- util ----
+
+    /** Serializa una lista de pendientes como array JSON. */
+    private static String jsonLista(List<Pendiente> lista) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < lista.size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append(lista.get(i).toJson());
+        }
+        return sb.append(']').toString();
+    }
 
     /** Usuario de la query (?usuario=Juan) normalizado: null si no viene o esta vacio. */
     private String usuarioDeQuery(HttpExchange ex) {
