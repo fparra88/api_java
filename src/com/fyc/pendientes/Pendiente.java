@@ -15,6 +15,9 @@ public class Pendiente {
     public String estado;        // pendiente | en proceso | terminado | en revision
     public String observaciones;
     public LocalDate fechaPromesa;
+    public String recurrencia;    // null | diaria | semanal | quincenal | mensual
+    public LocalDate fechaVisible; // null = visible ya; con fecha futura, oculta hasta llegar
+    public Integer plantillaId;    // liga esta instancia con la tarea original recurrente
 
     /** alta=1, media=2, baja=3 (menor numero = mas urgente). */
     public int prioridadNumerica() {
@@ -39,7 +42,10 @@ public class Pendiente {
           .append("\"prioridadNumerica\":").append(prioridadNumerica()).append(',')
           .append("\"estado\":").append(jsonStr(estado)).append(',')
           .append("\"observaciones\":").append(jsonStr(observaciones)).append(',')
-          .append("\"fechaPromesa\":").append(jsonStr(fechaPromesa))
+          .append("\"fechaPromesa\":").append(jsonStr(fechaPromesa)).append(',')
+          .append("\"recurrencia\":").append(jsonStr(recurrencia)).append(',')
+          .append("\"fechaVisible\":").append(jsonStr(fechaVisible)).append(',')
+          .append("\"plantillaId\":").append(plantillaId == null ? "null" : plantillaId)
           .append('}');
         return sb.toString();
     }

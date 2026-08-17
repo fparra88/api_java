@@ -1,6 +1,7 @@
 package com.fyc.pendientes;
 
 import java.sql.SQLException;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -100,16 +101,6 @@ public class GestorPendientes {
         return lista;
     }
 
-    /** Nivel de prioridad mas urgente entre las tareas 'en proceso' del usuario (0 = ninguna). */
-    private int nivelEnProceso(String usuario) throws SQLException {
-        int min = 0;
-        for (Pendiente p : dao.listarPorEstado("en proceso", usuario)) {
-            int n = p.prioridadNumerica();
-            if (min == 0 || n < min) min = n;
-        }
-        return min;
-    }
-
     /** Busca un pendiente por id en O(1). */
     public synchronized Pendiente buscar(int id) {
         return registro.get(id);
@@ -126,8 +117,9 @@ public class GestorPendientes {
 
     /**
      * Atiende el siguiente del usuario dado (null = global). Se puede tomar otra
-     * tarea con una ya 'en proceso', mientras sea del mismo nivel de prioridad;
-     * el estado abierto de un usuario nunca afecta a los demas.
+     * tarea con una ya 'en proceso': el usuario elige libremente, sin importar
+     * la prioridad de lo que ya tenga abierto. El estado de un usuario nunca
+     * afecta a los demas.
      */
     public synchronized Pendiente atenderSiguiente(String nuevoEstado, String usuario)
             throws SQLException {
@@ -139,16 +131,6 @@ public class GestorPendientes {
             if (p != null) cola.remove(p);
         }
         if (p == null) return null;
-
-        // Las 'en proceso' salen de la cola: si alguna es de nivel superior al
-        // siguiente en cola, no se puede bajar de nivel todavia. Se consulta la BD
-        // (no solo memoria) para sobrevivir reinicios del server.
-        int nivelAbierto = nivelEnProceso(usuario);
-        if (nivelAbierto > 0 && nivelAbierto < p.prioridadNumerica()) {
-            cola.offer(p); // devolver: no se atendio
-            throw new IllegalStateException(
-                "Tienes tareas de prioridad superior en proceso; terminalas antes de bajar de nivel");
-        }
 
         dao.actualizarEstado(p.id, nuevoEstado);
 
@@ -165,33 +147,16 @@ public class GestorPendientes {
 
     /**
      * Atiende un pendiente especifico (elegido por el usuario) en vez del top de la cola.
-     * Permite varias tareas 'en proceso' a la vez, siempre del MISMO nivel de prioridad:
-     * el usuario puede abrir otra tarea del nivel actual sin cerrar la que ya tiene.
+     * La prioridad no restringe la eleccion: el usuario puede tomar cualquier tarea
+     * suya en cola, tenga o no otras abiertas, sin importar el nivel de ninguna.
      * Reglas:
      *  - la tarea debe estar en cola y, si se da usuario, pertenecerle (null si no)
-     *  - no debe quedar en cola otra tarea del usuario con prioridad MAS alta
-     *    (IllegalStateException); dentro del mismo nivel cualquier tarea es valida.
-     *  - tampoco puede tener abierta una tarea de prioridad MAS alta: las 'en proceso'
-     *    salen de la cola, asi que se consultan aparte en la BD.
      */
     public synchronized Pendiente atenderPorId(int id, String nuevoEstado, String usuario)
             throws SQLException {
         Pendiente p = registro.get(id);
         if (p == null || !cola.contains(p)) return null;
         if (usuario != null && !esDeUsuario(p, usuario)) return null;
-
-        for (Pendiente otro : cola) {
-            if (usuario != null && !esDeUsuario(otro, usuario)) continue;
-            if (otro.prioridadNumerica() < p.prioridadNumerica()) {
-                throw new IllegalStateException(
-                    "Hay tareas de prioridad superior pendientes (" + otro.prioridad + ")");
-            }
-        }
-        int nivelAbierto = nivelEnProceso(usuario);
-        if (nivelAbierto > 0 && nivelAbierto < p.prioridadNumerica()) {
-            throw new IllegalStateException(
-                "Tienes tareas de prioridad superior en proceso; terminalas antes de bajar de nivel");
-        }
 
         cola.remove(p);
         dao.actualizarEstado(p.id, nuevoEstado);
@@ -209,6 +174,9 @@ public class GestorPendientes {
     /**
      * Marca un pendiente como terminado. Con usuario != null solo cierra tareas
      * de ese usuario (la BD valida pertenencia en el mismo UPDATE).
+     * Si la tarea tiene 'recurrencia', clona una instancia nueva con la
+     * siguiente fecha (oculta hasta llegar via fecha_visible) — la tarea nunca
+     * desaparece del todo, solo espera su turno.
      * Devuelve false si el id no existe o no pertenece al usuario.
      */
     public synchronized boolean terminar(int id, String usuario) throws SQLException {
@@ -223,7 +191,74 @@ public class GestorPendientes {
             p.estado = "terminado";
             contadorEstado.merge("terminado", 1, Integer::sum);
         }
+
+        // La fila en memoria puede no traer recurrencia/plantillaId si nunca se
+        // recargo desde que se agrego la columna; se relee de BD para estar seguros.
+        Pendiente completa = dao.buscarPorId(id);
+        if (completa != null && completa.recurrencia != null) {
+            LocalDate ancla = completa.fechaPromesa != null ? completa.fechaPromesa
+                             : (completa.fecha != null ? completa.fecha : LocalDate.now());
+            LocalDate proxima = proximaFecha(ancla, completa.recurrencia);
+            int plantillaId = completa.plantillaId != null ? completa.plantillaId : completa.id;
+            dao.insertarInstanciaRecurrente(completa, proxima, proxima, plantillaId);
+        }
         return true;
+    }
+
+    /**
+     * Crea un pendiente nuevo directo en BD y lo suma a la cola en memoria
+     * (visible de inmediato: sin fecha_visible, sin plantilla_id). FastAPI no
+     * conoce el campo 'recurrencia', asi que la creacion de tareas recurrentes
+     * pasa por aqui en vez de por el endpoint de FastAPI.
+     */
+    public synchronized Pendiente crear(String usuario, String actividad, String prioridad,
+                                          String observaciones, LocalDate fechaPromesa, String recurrencia)
+            throws SQLException {
+        int id = dao.insertarPendiente(usuario, actividad, prioridad, observaciones, fechaPromesa, recurrencia);
+        Pendiente p = new Pendiente();
+        p.id = id;
+        p.fecha = LocalDate.now();
+        p.usuario = usuario;
+        p.actividad = actividad;
+        p.prioridad = prioridad;
+        p.estado = "pendiente";
+        p.observaciones = observaciones;
+        p.fechaPromesa = fechaPromesa;
+        p.recurrencia = recurrencia;
+        p.fechaVisible = null;
+        p.plantillaId = null;
+
+        cola.offer(p);
+        registro.put(p.id, p);
+        contadorPrioridad.merge(p.prioridad, 1, Integer::sum);
+        contadorEstado.merge(p.estado, 1, Integer::sum);
+        return p;
+    }
+
+    /**
+     * Cambia solo la 'recurrencia' de un pendiente existente (usado al editar
+     * desde el panel, ya que FastAPI tampoco conoce este campo). null = quitarla.
+     * Devuelve el pendiente actualizado, o null si no existe / no pertenece al usuario.
+     */
+    public synchronized Pendiente actualizarRecurrencia(int id, String recurrencia, String usuario)
+            throws SQLException {
+        boolean ok = dao.actualizarRecurrencia(id, recurrencia, usuario);
+        if (!ok) return null;
+
+        Pendiente p = registro.get(id);
+        if (p != null) p.recurrencia = recurrencia; // misma referencia que en 'cola'
+        return dao.buscarPorId(id);
+    }
+
+    /** diaria +1d, semanal +7d, quincenal +15d, mensual +1 mes. */
+    private static LocalDate proximaFecha(LocalDate ancla, String recurrencia) {
+        return switch (recurrencia.toLowerCase()) {
+            case "diaria"    -> ancla.plusDays(1);
+            case "semanal"   -> ancla.plusWeeks(1);
+            case "quincenal" -> ancla.plusDays(15);
+            case "mensual"   -> ancla.plusMonths(1);
+            default           -> ancla;
+        };
     }
 
     public synchronized int tamano()    { return cola.size(); }

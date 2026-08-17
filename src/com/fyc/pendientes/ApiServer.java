@@ -9,6 +9,8 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
 import java.util.List;
 
 /**
@@ -64,6 +66,49 @@ public class ApiServer {
         String usuario = usuarioDeQuery(ex); // null = comportamiento global
 
         try {
+            // POST /api/pendientes/nueva?usuario=&actividad=&prioridad=&observaciones=&fecha_promesa=&recurrencia=
+            // FastAPI (registro-agregar) no conoce 'recurrencia'; las tareas
+            // recurrentes se crean aqui para que la columna quede seteada.
+            if (metodo.equalsIgnoreCase("POST") && path.endsWith("/nueva")) {
+                String actividad = queryParam(ex, "actividad");
+                String prioridad = queryParam(ex, "prioridad");
+                if (usuario == null || actividad == null || actividad.isBlank()
+                        || prioridad == null || prioridad.isBlank()) {
+                    responder(ex, 400, "{\"error\":\"usuario, actividad y prioridad son obligatorios\"}");
+                    return;
+                }
+                String observaciones = queryParam(ex, "observaciones");
+                String recurrencia = queryParam(ex, "recurrencia");
+                if (recurrencia != null && recurrencia.isBlank()) recurrencia = null;
+                String fechaPromesaStr = queryParam(ex, "fecha_promesa");
+                LocalDate fechaPromesa = null;
+                if (fechaPromesaStr != null && !fechaPromesaStr.isBlank()) {
+                    try {
+                        fechaPromesa = LocalDate.parse(fechaPromesaStr);
+                    } catch (DateTimeParseException dtpe) {
+                        responder(ex, 400, "{\"error\":\"fecha_promesa invalida (usa yyyy-MM-dd)\"}");
+                        return;
+                    }
+                }
+                Pendiente creado = gestor.crear(usuario, actividad, prioridad, observaciones, fechaPromesa, recurrencia);
+                responder(ex, 200, creado.toJson());
+                return;
+            }
+            // POST /api/pendientes/{id}/recurrencia?usuario=&valor=diaria|semanal|quincenal|mensual (vacio = quitar)
+            if (metodo.equalsIgnoreCase("POST") && path.endsWith("/recurrencia")) {
+                String segmento = path.substring("/api/pendientes/".length()); // "5/recurrencia"
+                String idStr = segmento.replace("/recurrencia", "");
+                try {
+                    String valor = queryParam(ex, "valor");
+                    if (valor != null && valor.isBlank()) valor = null;
+                    Pendiente actualizado = gestor.actualizarRecurrencia(Integer.parseInt(idStr), valor, usuario);
+                    if (actualizado == null) { responder(ex, 404, "{\"mensaje\":\"No encontrado\"}"); return; }
+                    responder(ex, 200, actualizado.toJson());
+                } catch (NumberFormatException nfe) {
+                    responder(ex, 400, "{\"error\":\"id invalido\"}");
+                }
+                return;
+            }
             // POST /api/pendientes/{id}/terminar
             if (metodo.equalsIgnoreCase("POST") && path.endsWith("/terminar")) {
                 String segmento = path.substring("/api/pendientes/".length()); // "5/terminar"
@@ -89,19 +134,12 @@ public class ApiServer {
                         responder(ex, 200, "{\"atendido\":" + p.toJson() + ",\"enCola\":" + gestor.tamano(usuario) + "}");
                     } catch (NumberFormatException nfe) {
                         responder(ex, 400, "{\"error\":\"id invalido\"}");
-                    } catch (IllegalStateException ise) {
-                        // Regla de niveles: existe tarea de prioridad superior sin atender.
-                        responder(ex, 409, "{\"error\":\"" + escapar(ise.getMessage()) + "\"}");
                     }
                     return;
                 }
-                try {
-                    Pendiente p = gestor.atenderSiguiente("en proceso", usuario);
-                    if (p == null) { responder(ex, 404, "{\"mensaje\":\"No hay pendientes en cola\"}"); return; }
-                    responder(ex, 200, "{\"atendido\":" + p.toJson() + ",\"enCola\":" + gestor.tamano(usuario) + "}");
-                } catch (IllegalStateException ise) {
-                    responder(ex, 409, "{\"error\":\"" + escapar(ise.getMessage()) + "\"}");
-                }
+                Pendiente p = gestor.atenderSiguiente("en proceso", usuario);
+                if (p == null) { responder(ex, 404, "{\"mensaje\":\"No hay pendientes en cola\"}"); return; }
+                responder(ex, 200, "{\"atendido\":" + p.toJson() + ",\"enCola\":" + gestor.tamano(usuario) + "}");
                 return;
             }
             // GET /api/pendientes/en-proceso?usuario=xxx  -> tareas abiertas (array, puede ser varias)
